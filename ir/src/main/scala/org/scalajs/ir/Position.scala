@@ -12,20 +12,21 @@
 
 package org.scalajs.ir
 
+/** Represents a character position in a source file
+ *
+ *  @param source Source file
+ *  @param line Zero-based line number
+ *  @param column Zero-based column number
+ */
 final case class Position(
-    /** Source file. */
-    source: Position.SourceFile,
-    /** Zero-based line number. */
-    line: Int,
-    /** Zero-based column number. */
-    column: Int
+    source: Position.SourceFile, line: Int, column: Int
 ) {
   def show: String = s"$line:$column"
 
   def isEmpty: Boolean = {
     def isEmptySlowPath(): Boolean = {
       source.getScheme == null && source.getRawAuthority == null &&
-        source.getRawQuery == null && source.getRawFragment == null
+      source.getRawQuery == null && source.getRawFragment == null
     }
     source.getRawPath == "" && isEmptySlowPath()
   }
