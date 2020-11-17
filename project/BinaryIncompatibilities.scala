@@ -16,10 +16,14 @@ object BinaryIncompatibilities {
   val SbtPlugin = Seq(
   )
 
-  val TestCommon = Seq(
-  )
-
-  val TestAdapter = TestCommon ++ Seq(
+  val TestAdapter = Seq(
+      // private[testing], not an issue
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+          "org.scalajs.testing.common.JVMEndpoints.*"),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+          "org.scalajs.testing.common.JSEndpoints.*"),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+          "org.scalajs.testing.common.FrameworkMessage.*"),
   )
 
   val Library = Seq(
