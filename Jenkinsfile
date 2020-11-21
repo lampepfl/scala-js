@@ -164,7 +164,10 @@ def Tasks = [
         testInterface$v/compile:doc testBridge$v/compile:doc &&
     sbtretry ++$scala headerCheck &&
     sbtretry ++$scala partest$v/fetchScalaSource &&
-    sbtretry ++$scala library$v/mimaReportBinaryIssues testInterface$v/mimaReportBinaryIssues &&
+    sbtretry ++$scala \
+        library$v/mimaReportBinaryIssues \
+        testInterface$v/mimaReportBinaryIssues \
+        jUnitRuntime$v/mimaReportBinaryIssues &&
     sh ci/checksizes.sh $scala &&
     sh ci/check-partest-coverage.sh $scala
   ''',
