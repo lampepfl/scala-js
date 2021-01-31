@@ -1504,9 +1504,6 @@ object IRChecker {
   }
 
   private object ErrorContext {
-    implicit def node2errorContext(node: IRNode): ErrorContext =
-      ErrorContext(node)
-
     def apply(node: IRNode): ErrorContext =
       new ErrorContext(node)
 
