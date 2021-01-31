@@ -717,7 +717,7 @@ object AnalyzerTest {
       implicit ec: ExecutionContext): Future[Analysis] = {
     for {
       baseFiles <- stdlib
-      irLoader <- new IRLoader().update(classDefs.map(MemClassDefIRFile(_)) ++ baseFiles)
+      irLoader <- new IRLoader().update(classDefs.map(MemClassDefIRFile(_)) ++ baseFiles, NullLogger)
       analysis <- Analyzer.computeReachability(
           CommonPhaseConfig.fromStandardConfig(config), moduleInitializers,
           symbolRequirements, allowAddingSyntheticMethods = true,
