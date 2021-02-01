@@ -665,6 +665,8 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
           }
 
         case While(cond, body) =>
+          val loopEnv = env.withInLoopForVarCapture(true)
+
           /* If there is a Labeled block immediately enclosed within the body
            * of this while loop, acquire its label and use it as the while's
            * label, turning it into a `continue` label.
@@ -672,11 +674,12 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
           val (optLabel, newBody) = {
             body match {
               case Labeled(label, _, innerBody) =>
-                val innerBodyEnv = env
+                val innerBodyEnv = loopEnv
                   .withLabeledExprLHS(label, Lhs.Discard)
                   .withTurnLabelIntoContinue(label.name)
                   .withDefaultBreakTargets(tailPosLabels)
                   .withDefaultContinueTargets(Set(label.name))
+
                 val newBody =
                   pushLhsInto(Lhs.Discard, innerBody, Set(label.name))(innerBodyEnv)
                 val optLabel = if (usedLabels.contains(label.name))
@@ -686,9 +689,10 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
                 (optLabel, newBody)
 
               case _ =>
-                val bodyEnv = env
+                val bodyEnv = loopEnv
                   .withDefaultBreakTargets(tailPosLabels)
                   .withDefaultContinueTargets(Set.empty)
+                  .withInLoopForVarCapture(true)
                 val newBody = transformStat(body, Set.empty)(bodyEnv)
                 (None, newBody)
             }
@@ -698,21 +702,23 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
            * evaluation of the condition out of the loop.
            */
           if (isExpression(cond)) {
-            js.While(transformExprNoChar(cond), newBody, optLabel)
+            js.While(transformExprNoChar(cond)(loopEnv), newBody, optLabel)
           } else {
             js.While(js.BooleanLiteral(true), {
               unnest(cond) { (newCond, env0) =>
                 implicit val env = env0
                 js.If(transformExprNoChar(newCond), newBody, js.Break())
-              }
+              } (loopEnv)
             }, optLabel)
           }
 
         case DoWhile(body, cond) =>
+          val loopEnv = env.withInLoopForVarCapture(true)
+
           /* We cannot simply unnest(cond) here, because that would eject the
            * evaluation of the condition out of the loop.
            */
-          val bodyEnv = env
+          val bodyEnv = loopEnv
             .withDefaultBreakTargets(tailPosLabels)
             .withDefaultContinueTargets(Set.empty)
           val newBody = transformStat(body, Set.empty)(bodyEnv)
@@ -721,7 +727,7 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
              * `While` loops (see above), but no Scala source code produces
              * patterns where this happens. Therefore, we do not bother.
              */
-            js.DoWhile(newBody, transformExprNoChar(cond))
+            js.DoWhile(newBody, transformExprNoChar(cond)(loopEnv))
           } else {
             /* Since in this rewriting, the old body is not in tail position of
              * the emitted do..while body, we cannot optimize an inner Labeled
@@ -733,7 +739,7 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
                   unnest(cond) { (newCond, env0) =>
                     implicit val env = env0
                     js.If(transformExprNoChar(newCond), js.Skip(), js.Break())
-                  })
+                  } (loopEnv))
             })
           }
 
@@ -743,9 +749,12 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
 
             val lhs = genEmptyImmutableLet(
                 transformLocalVarIdent(keyVar, keyVarOriginalName))
+            val bodyEnv = env
+              .withDef(keyVar, mutable = false)
+              .withInLoopForVarCapture(true)
+
             js.ForIn(lhs, transformExprNoChar(newObj), {
-              transformStat(body, Set.empty)(
-                  env.withDef(keyVar, mutable = false))
+              transformStat(body, Set.empty)(bodyEnv)
             })
           }
 
@@ -1369,6 +1378,28 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
      */
     def isPureExpression(tree: Tree)(implicit env: Env): Boolean =
       isExpressionInternal(tree, allowUnpure = false, allowSideEffects = false)
+
+    /** Test if the given tree may be used without being explicitly captured. */
+    def mayElideIIFECapture(tree: Tree, allowThis: Boolean)(implicit env: Env): Boolean = tree match {
+      case _: Literal =>
+        true
+
+      case VarRef(name) =>
+        !env.inLoopForVarCapture && !env.isLocalMutable(name)
+
+      case Transient(JSVarRef(_, mutable)) =>
+        !env.inLoopForVarCapture && !mutable
+
+      case This() =>
+        /* If `thisIdent.isDefined`, `This()` actually refers to another
+         * variable, so we need not be concerned about the JS `this` being
+         * changed.
+         */
+        (useArrowFunctions && allowThis) || env.thisIdent.isDefined
+
+      case _ =>
+        false
+    }
 
     def doVarDef(ident: js.Ident, tpe: Type, mutable: Boolean, rhs: Tree)(
         implicit env: Env): js.Tree = {
@@ -2250,24 +2281,35 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
               transformTypedArgs(method.name, args))
 
         case ApplyDynamicImport(flags, className, method, args) =>
-          // Protect the args by an IIFE to avoid bad loop captures (see #4385).
-          val captureParams =
-            args.map(_ => js.ParamDef(newSyntheticVar(), rest = false))
+          // Protect non-elidable args by an IIFE to avoid bad loop captures (see #4385).
+          val targs = transformTypedArgs(method.name, args)
 
-          val innerCall = extractWithGlobals {
-            withDynamicGlobalVar("s", (className, method.name)) { v =>
-              js.Apply(v, captureParams.map(_.ref))
+          val capturesBuilder = List.newBuilder[(js.ParamDef, js.Tree)]
+
+          val newArgs = for {
+            (arg, targ) <- args.zip(targs)
+          } yield {
+            if (mayElideIIFECapture(arg, allowThis = true)) {
+              targ
+            } else {
+              val v = newSyntheticVar()
+              capturesBuilder += js.ParamDef(v, rest = false) -> targ
+              js.VarRef(v)
             }
           }
 
-          if (captureParams.isEmpty) {
-            innerCall
-          } else {
-            val captures =
-              captureParams.zip(transformTypedArgs(method.name, args))
-
-            genIIFE(captures, js.Return(innerCall))
+          val innerCall = extractWithGlobals {
+            withDynamicGlobalVar("s", (className, method.name)) { v =>
+              js.Apply(v, newArgs)
+            }
           }
+
+          val captures = capturesBuilder.result()
+
+          if (captures.isEmpty)
+            innerCall
+          else
+            genIIFE(captures, js.Return(innerCall))
 
         case UnaryOp(op, lhs) =>
           import UnaryOp._
@@ -2844,10 +2886,13 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
         // Atomic expressions
 
         case VarRef(name) =>
-          if (env.isLocalVar(name))
-            js.VarRef(transformLocalVarIdent(name))
-          else
+          if (env.isLocalVar(name)) {
+            env.localReplacement(name)
+              .getOrElse(js.VarRef(transformLocalVarIdent(name)))
+          } else {
+            // If we do not know the name, it's a class capture.
             fileLevelVar("cc", genName(name.name))
+          }
 
         case Transient(JSVarRef(name, _)) =>
           js.VarRef(name)
@@ -2860,16 +2905,29 @@ private[emitter] class FunctionEmitter(sjsGen: SJSGen) {
           }
 
         case Closure(arrow, captureParams, params, body, captureValues) =>
-          val innerFunction = {
-            desugarToFunctionInternal(arrow, params, body, isStat = false,
-                Env.empty(AnyType).withParams(captureParams ++ params))
-          }
+          val capturesBuilder = List.newBuilder[(js.ParamDef, js.Tree)]
+          val replacementsBuilder = Map.newBuilder[LocalName, js.Tree]
 
-          val captures = for {
+          for {
             (param, value) <- captureParams.zip(captureValues)
           } yield {
-            (transformParamDef(param), transformExpr(value, param.ptpe))
+            val newValue = transformExpr(value, param.ptpe)
+
+            if (mayElideIIFECapture(value, allowThis = arrow))
+              replacementsBuilder += param.name.name -> newValue
+            else
+              capturesBuilder += transformParamDef(param) -> newValue
           }
+
+          val innerFunction = {
+            val bodyEnv = Env.empty(AnyType)
+              .withParams(captureParams ++ params)
+              .withLocalReplacements(replacementsBuilder.result())
+
+            desugarToFunctionInternal(arrow, params, body, isStat = false, bodyEnv)
+          }
+
+          val captures = capturesBuilder.result()
 
           if (captures.isEmpty) {
             innerFunction
@@ -3111,10 +3169,12 @@ private object FunctionEmitter {
       val expectedReturnType: Type,
       val enclosingClassName: Option[ClassName],
       vars: Map[LocalName, Boolean],
+      localReplacements: Map[LocalName, js.Tree],
       labeledExprLHSes: Map[LabelName, Lhs],
       labelsTurnedIntoContinue: Set[LabelName],
       defaultBreakTargets: Set[LabelName],
-      defaultContinueTargets: Set[LabelName]
+      defaultContinueTargets: Set[LabelName],
+      val inLoopForVarCapture: Boolean
   ) {
     def isLocalVar(ident: LocalIdent): Boolean = vars.contains(ident.name)
 
@@ -3124,6 +3184,9 @@ private object FunctionEmitter {
        */
       vars.getOrElse(ident.name, false)
     }
+
+    def localReplacement(ident: LocalIdent): Option[js.Tree] =
+      localReplacements.get(ident.name)
 
     def lhsForLabeledExpr(label: LabelIdent): Lhs = labeledExprLHSes(label.name)
 
@@ -3152,6 +3215,9 @@ private object FunctionEmitter {
     def withDef(ident: LocalIdent, mutable: Boolean): Env =
       copy(vars = vars + (ident.name -> mutable))
 
+    def withLocalReplacements(replacements: Map[LocalName, js.Tree]): Env =
+      copy(localReplacements = localReplacements ++ replacements)
+
     def withLabeledExprLHS(label: LabelIdent, lhs: Lhs): Env =
       copy(labeledExprLHSes = labeledExprLHSes + (label.name -> lhs))
 
@@ -3164,25 +3230,30 @@ private object FunctionEmitter {
     def withDefaultContinueTargets(targets: Set[LabelName]): Env =
       copy(defaultContinueTargets = targets)
 
+    def withInLoopForVarCapture(inLoopForVarCapture: Boolean): Env =
+      copy(inLoopForVarCapture = inLoopForVarCapture)
+
     private def copy(
         thisIdent: Option[js.Ident] = this.thisIdent,
         expectedReturnType: Type = this.expectedReturnType,
         enclosingClassName: Option[ClassName] = this.enclosingClassName,
         vars: Map[LocalName, Boolean] = this.vars,
+        localReplacements: Map[LocalName, js.Tree] = this.localReplacements,
         labeledExprLHSes: Map[LabelName, Lhs] = this.labeledExprLHSes,
         labelsTurnedIntoContinue: Set[LabelName] = this.labelsTurnedIntoContinue,
         defaultBreakTargets: Set[LabelName] = this.defaultBreakTargets,
-        defaultContinueTargets: Set[LabelName] = this.defaultContinueTargets): Env = {
-      new Env(thisIdent, expectedReturnType, enclosingClassName, vars,
+        defaultContinueTargets: Set[LabelName] = this.defaultContinueTargets,
+        inLoopForVarCapture: Boolean = this.inLoopForVarCapture): Env = {
+      new Env(thisIdent, expectedReturnType, enclosingClassName, vars, localReplacements,
           labeledExprLHSes, labelsTurnedIntoContinue, defaultBreakTargets,
-          defaultContinueTargets)
+          defaultContinueTargets, inLoopForVarCapture)
     }
   }
 
   object Env {
     def empty(expectedReturnType: Type): Env = {
-      new Env(None, expectedReturnType, None, Map.empty, Map.empty, Set.empty,
-          Set.empty, Set.empty)
+      new Env(None, expectedReturnType, None, Map.empty, Map.empty, Map.empty,
+          Set.empty, Set.empty, Set.empty, false)
     }
   }
 }
