@@ -45,7 +45,7 @@ final class BaseLinker(config: CommonPhaseConfig) {
       implicit ec: ExecutionContext): Future[LinkingUnit] = {
 
     val result = for {
-      _ <- irLoader.update(irInput)
+      _ <- irLoader.update(irInput, logger)
       analysis <- logger.timeFuture("Linker: Compute reachability") {
         analyze(moduleInitializers, symbolRequirements, logger)
       }

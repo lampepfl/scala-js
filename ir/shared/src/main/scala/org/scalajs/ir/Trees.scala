@@ -1093,17 +1093,6 @@ object Trees {
       body: Option[Tree])(
       val optimizerHints: OptimizerHints, val hash: Option[TreeHash])(
       implicit val pos: Position) extends MemberDef {
-
-    require(!flags.isMutable, "nonsensical mutable MethodDef")
-
-    require(!name.name.isReflectiveProxy || flags.namespace == MemberNamespace.Public,
-        "reflective proxies must be in the public (non-static) namespace")
-    require(name.name.isConstructor == (flags.namespace == MemberNamespace.Constructor),
-        "a member can have a constructor name iff it is in the constructor namespace")
-    require((name.name.isStaticInitializer || name.name.isClassInitializer) ==
-        (flags.namespace == MemberNamespace.StaticConstructor),
-        "a member can have a static constructor name iff it is in the static constructor namespace")
-
     def methodName: MethodName = name.name
   }
 
@@ -1113,28 +1102,17 @@ object Trees {
       args: List[ParamDef], restParam: Option[ParamDef], body: Tree)(
       val optimizerHints: OptimizerHints, val hash: Option[TreeHash])(
       implicit val pos: Position)
-      extends JSMethodPropDef {
-
-    require(!flags.isMutable, "nonsensical mutable MethodDef")
-  }
+      extends JSMethodPropDef
 
   sealed case class JSPropertyDef(flags: MemberFlags, name: Tree,
       getterBody: Option[Tree], setterArgAndBody: Option[(ParamDef, Tree)])(
       implicit val pos: Position)
-      extends JSMethodPropDef {
-
-    require(!flags.isMutable, "nonsensical mutable PropertyDef")
-  }
+      extends JSMethodPropDef
 
   sealed case class JSNativeMemberDef(flags: MemberFlags, name: MethodIdent,
       jsNativeLoadSpec: JSNativeLoadSpec)(
       implicit val pos: Position)
-      extends MemberDef {
-
-    require(!flags.isMutable, "nonsensical mutable JSNativeMemberDef")
-    require(flags.namespace == MemberNamespace.PublicStatic,
-        "JSNativeMemberDef must have the namespace PublicStatic")
-  }
+      extends MemberDef
 
   // Top-level export defs
 
